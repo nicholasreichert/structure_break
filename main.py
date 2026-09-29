@@ -5,7 +5,9 @@ Pipeline
 --------
 1. From the historical segment, fit a null model of each series: its mean/sd, its
    empirical distribution (for rank-based "normal scores"), and an AR(20) fit whose
-   residuals capture any change in dependence (a changed process predicts worse).
+   residuals capture any change in dependence (a changed process predicts worse). A second,
+   nonlinear predictor (ridge on random Fourier features of the last 10 normal scores, with
+   its own conditional-variance model) adds error streams for dependence AR cannot express.
 2. Turn every observation into *streams*, one per kind of break (variance, shape,
    tails, dependence, predictability). Each stream is standardised by its historical
    mean and long-run sd, so under "no break" it is roughly mean 0 / variance 1.
@@ -42,7 +44,9 @@ STREAMS = (
     "z", "z2", "g", "g2", "absg", "g4", "tail", "gg1", "gg2", "gg3", "zz1",
     "absdz", "dz2", "vol1", "r", "absr", "r2", "rg2", "absrg",
     "zf2", "gg5", "gg10", "sgn1", "g3", "vol5", "upper", "center",
+    "nl_e2", "nl_std2", "nl_logv", "nl_gain",
 )
+N_LEARNED = 4  # the nl_* streams come last; their history values are leave-one-out
 VOL_LAMBDA = 0.94  # EWMA volatility filter for zf2
 CENTER_G = 0.2533471031357997  # |g| below this <=> middle 20% of the historical distribution
 # every statistic keeps its sign: breaks and no-break drift push streams in different directions
@@ -79,6 +83,47 @@ def _normal_score_table(sorted_vals: np.ndarray) -> list:
     return ndtri((half_ranks + 0.5) / (n + 1.0)).tolist()
 
 
+# ------------------------------------------------------------- learned next-value predictor
+# Ridge regression of g_t on [its last NL_P lags, random Fourier features of those lags]: an
+# approximate Gaussian-kernel regression, so it can learn nonlinear dependence AR(p) cannot.
+# The penalty is picked per series by leave-one-out error (closed form from one SVD), and the
+# history's error stream uses the LOO residuals, so it is out-of-sample like the online errors.
+NL_P = 10
+NL_D = 100
+NL_BANDWIDTH = 3.0
+NL_LAMBDAS = (1e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0, 3.0, 10.0, 100.0)  # multiples of n
+_rff = np.random.default_rng(0)
+NL_W = _rff.normal(size=(NL_P, NL_D)) / NL_BANDWIDTH
+NL_B = _rff.uniform(0.0, 2.0 * math.pi, size=NL_D)
+NL_C = math.sqrt(2.0 / NL_D)
+del _rff
+
+
+def _nl_features(L: np.ndarray) -> np.ndarray:
+    """Rows of lag vectors (most recent first) -> [lags, random Fourier features]."""
+    return np.hstack([L, NL_C * np.cos(L @ NL_W + NL_B)])
+
+
+def _ridge_loo(F: np.ndarray, y: np.ndarray):
+    """Ridge with an unpenalised intercept. Returns (beta, intercept, LOO residuals)."""
+    n = len(y)
+    fm, ym = F.mean(0), float(y.mean())
+    U, s, Vt = np.linalg.svd(F - fm, full_matrices=False)
+    uy = U.T @ (y - ym)
+    s2 = s * s
+    U2 = U * U
+    best = None
+    for lam in NL_LAMBDAS:
+        sh = s2 / (s2 + lam * n)
+        loo = (y - U @ (sh * uy) - ym) / (1.0 - U2 @ sh - 1.0 / n)
+        mse = float(loo @ loo)
+        if best is None or mse < best[0]:
+            best = (mse, lam, loo)
+    _, lam, loo = best
+    beta = Vt.T @ (s / (s2 + lam * n) * uy)
+    return beta, ym - float(fm @ beta), loo
+
+
 class FeatureState:
     """Running state for one series. `update(x)` returns the feature vector (list)."""
 
@@ -102,11 +147,16 @@ class FeatureState:
         self.r_sorted = np.sort(r / self.r_sd).tolist()
         self.rtab = _normal_score_table(np.asarray(self.r_sorted))
 
+        nl_hist = self._fit_learned(xh)
+
         self.vol = 1.0  # EWMA of z^2, carried from the history into the online segment
         # replay the history through the same stream function to get null statistics
         self.z_lags = z[:MAX_LAG][::-1].tolist()  # most recent first
         self.g_lags = [self._g(v) for v in xh[:MAX_LAG][::-1]]
+        self.replay = True  # skip the online predictor; nl_hist holds the LOO values
         H = np.array([self._raw(float(v)) for v in xh[MAX_LAG:]])
+        self.replay = False
+        H[:, -N_LEARNED:] = nl_hist[MAX_LAG - NL_P :]
         self.center = H.mean(0).tolist()
         self.scale = [1.0 / _long_run_sd(H[:, i]) for i in range(H.shape[1])]
         # the online segment continues the history: lags now hold the last MAX_LAG points
@@ -120,6 +170,35 @@ class FeatureState:
         self.dn = [[0.0] * ns for _ in CUSUM_K]
         self.ew = [0.0] * ns
         self.ew_norm = math.sqrt((2.0 - EWMA_ALPHA) / EWMA_ALPHA)
+
+    _NL_ZERO = (0.0,) * N_LEARNED
+
+    def _fit_learned(self, xh: np.ndarray) -> np.ndarray:
+        """Fit the nonlinear predictor on the history; return its LOO streams, rows NL_P.."""
+        xs = np.asarray(self.x_sorted)
+        idx = np.searchsorted(xs, xh, "left") + np.searchsorted(xs, xh, "right")
+        g = np.asarray(self.gtab)[idx]
+        n = len(g)
+        L = np.column_stack([g[NL_P - i - 1 : n - i - 1] for i in range(NL_P)])
+        F = _nl_features(L)
+        y = g[NL_P:]
+        beta, self.nl_c0, e = _ridge_loo(F, y)
+        e2 = e * e
+        self.vfloor = 0.1 * float(e2.mean())
+        bv, self.nl_v0, loov = _ridge_loo(F, e2)
+        v = np.maximum(e2 - loov, self.vfloor)  # LOO prediction of e2
+        ba, self.nl_a0, ea = _ridge_loo(L, y)  # linear AR(NL_P) on the same footing
+        self.nl_beta, self.nl_bv, self.nl_ba = beta, bv, ba
+        return np.column_stack([e2, e2 / v, np.log(v), ea * ea - e2])
+
+    def _learned(self, gt: float, gl: list) -> tuple:
+        u = np.array(gl[:NL_P])
+        f = np.concatenate([u, NL_C * np.cos(u @ NL_W + NL_B)])
+        e = gt - float(f @ self.nl_beta) - self.nl_c0
+        e2 = e * e
+        v = max(float(f @ self.nl_bv) + self.nl_v0, self.vfloor)
+        ea = gt - float(u @ self.nl_ba) - self.nl_a0
+        return (e2, e2 / v, math.log(v), ea * ea - e2)
 
     def _g(self, x: float) -> float:
         xs = self.x_sorted
@@ -171,7 +250,7 @@ class FeatureState:
             ag * abs(gl[4]),
             1.0 if gt > 0.0 else 0.0,
             1.0 if ag < CENTER_G else 0.0,
-        )
+        ) + (self._NL_ZERO if self.replay else self._learned(gt, gl))
         zl.insert(0, zt)
         zl.pop()
         gl.insert(0, gt)
