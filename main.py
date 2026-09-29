@@ -28,11 +28,11 @@ import numpy as np
 from scipy.special import ndtri
 
 # @crunch/keep:on
-INFER_PARALLELISM = 4
+INFER_PARALLELISM = 12
 
 AR_ORDER = 20
 MAX_LAG = AR_ORDER
-CUSUM_K = (0.1, 0.5)
+CUSUM_K = (0.1, 0.3)
 WINDOWS = (16, 64, 256)
 EWMA_ALPHA = 0.03
 G4_CAP = 50.0
@@ -41,8 +41,17 @@ TAIL_Z = 1.6448536269514722  # two-sided 10% tail of N(0,1)
 STREAMS = (
     "z", "z2", "g", "g2", "absg", "g4", "tail", "gg1", "gg2", "gg3", "zz1",
     "absdz", "dz2", "vol1", "r", "absr", "r2", "rg2", "absrg",
+    "zf2", "gg5", "gg10", "sgn1", "g3", "vol5", "upper", "center",
 )
-STAT_NAMES = ["sum"] + [f"cusum{k}" for k in CUSUM_K] + [f"w{w}" for w in WINDOWS] + ["ewma"]
+VOL_LAMBDA = 0.94  # EWMA volatility filter for zf2
+CENTER_G = 0.2533471031357997  # |g| below this <=> middle 20% of the historical distribution
+# every statistic keeps its sign: breaks and no-break drift push streams in different directions
+STAT_NAMES = (
+    ["sum"]
+    + [f"cusum{d}{k}" for k in CUSUM_K for d in ("up", "dn")]
+    + [f"w{w}" for w in WINDOWS]
+    + ["ewma", "glr", "glr_age"]
+)
 META_NAMES = ["log_n"]
 FEATURE_NAMES = META_NAMES + [f"{s}_{st}" for s in STREAMS for st in STAT_NAMES]
 N_FEATURES = len(FEATURE_NAMES)
@@ -93,6 +102,7 @@ class FeatureState:
         self.r_sorted = np.sort(r / self.r_sd).tolist()
         self.rtab = _normal_score_table(np.asarray(self.r_sorted))
 
+        self.vol = 1.0  # EWMA of z^2, carried from the history into the online segment
         # replay the history through the same stream function to get null statistics
         self.z_lags = z[:MAX_LAG][::-1].tolist()  # most recent first
         self.g_lags = [self._g(v) for v in xh[:MAX_LAG][::-1]]
@@ -104,7 +114,8 @@ class FeatureState:
         ns = len(STREAMS)
         self.n = 0
         self.sums = [0.0] * ns
-        self.cum = [[0.0] * ns]  # cumulative sums at every step, for windowed sums
+        # cumulative sums at every step (row n = after n points), for windows and the GLR
+        self.cum = np.zeros((64, ns))
         self.up = [[0.0] * ns for _ in CUSUM_K]
         self.dn = [[0.0] * ns for _ in CUSUM_K]
         self.ew = [0.0] * ns
@@ -128,6 +139,10 @@ class FeatureState:
         d = zt - zl[0]
         g2 = gt * gt
         ag = abs(gt)
+        z2 = zt * zt
+        zf2 = z2 / self.vol
+        self.vol = VOL_LAMBDA * self.vol + (1.0 - VOL_LAMBDA) * z2
+        g1 = gl[0]
         out = (
             zt,
             zt * zt,
@@ -148,6 +163,14 @@ class FeatureState:
             rt * rt,
             rg * rg,
             abs(rg),
+            zf2,
+            gt * gl[4],
+            gt * gl[9],
+            (1.0 if gt > 0 else -1.0 if gt < 0 else 0.0) * (1.0 if g1 > 0 else -1.0 if g1 < 0 else 0.0),
+            g2 * gt,
+            ag * abs(gl[4]),
+            1.0 if gt > 0.0 else 0.0,
+            1.0 if ag < CENTER_G else 0.0,
         )
         zl.insert(0, zt)
         zl.pop()
@@ -166,28 +189,36 @@ class FeatureState:
         for i in range(ns):
             sums[i] += e[i]
         cum = self.cum
-        cum.append(sums[:])
+        if n >= len(cum):
+            cum = self.cum = np.concatenate([cum, np.zeros_like(cum)])
+        cum[n] = sums
         inv_sqrt_n = 1.0 / math.sqrt(n)
 
         win = []
         for w in WINDOWS:
             if n > w:
-                base = cum[n - w]
                 c = 1.0 / math.sqrt(w)
-                win.append([abs(sums[i] - base[i]) * c for i in range(ns)])
+                win.append(((cum[n] - cum[n - w]) * c).tolist())
             else:
-                win.append([abs(s) * inv_sqrt_n for s in sums])
+                win.append([s * inv_sqrt_n for s in sums])
+
+        # GLR for a mean shift at an unknown point j: max_j (S_n - S_j)^2 / (n - j)
+        seg = cum[n] - cum[:n]
+        stat = seg * seg * (1.0 / np.arange(n, 0, -1, dtype=np.float64))[:, None]
+        jstar = stat.argmax(0)
+        cols = np.arange(ns)
+        glr = (seg[jstar, cols] / np.sqrt(n - jstar)).tolist()  # signed shift at the best split
+        glr_age = np.log(n - jstar).tolist()
 
         cus = []
         for k, up, dn in zip(CUSUM_K, self.up, self.dn):
-            row = []
             for i in range(ns):
                 u = up[i] + e[i] - k
                 up[i] = u if u > 0.0 else 0.0
                 v = dn[i] - e[i] - k
                 dn[i] = v if v > 0.0 else 0.0
-                row.append(up[i] if up[i] > dn[i] else dn[i])
-            cus.append(row)
+            cus.append(up[:])
+            cus.append(dn[:])
 
         a, b, ew = EWMA_ALPHA, 1.0 - EWMA_ALPHA, self.ew
         for i in range(ns):
@@ -195,12 +226,14 @@ class FeatureState:
 
         feats = [math.log(n)]
         for i in range(ns):
-            feats.append(abs(sums[i]) * inv_sqrt_n)
+            feats.append(sums[i] * inv_sqrt_n)
             for row in cus:
                 feats.append(row[i])
             for row in win:
                 feats.append(row[i])
-            feats.append(abs(ew[i]) * self.ew_norm)
+            feats.append(ew[i] * self.ew_norm)
+            feats.append(glr[i])
+            feats.append(glr_age[i])
         return feats
 
 
@@ -214,7 +247,7 @@ def series_features(x_hist, x_online) -> np.ndarray:
 LGB_PARAMS = dict(
     objective="binary",
     learning_rate=0.05,
-    num_leaves=31,
+    num_leaves=15,
     min_data_in_leaf=2000,
     feature_fraction=0.7,
     bagging_fraction=0.8,
