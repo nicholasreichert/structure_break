@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-
-data/
+# local-only: data and venv are junctions to the main checkout
+data
+cache/
+figures/
+prediction/
