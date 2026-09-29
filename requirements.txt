@@ -1,0 +1,4 @@
+lightgbm
+numpy
+scipy
+threadpoolctl
