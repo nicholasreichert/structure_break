@@ -263,7 +263,11 @@ def infer(
     import lightgbm as lgb
     from threadpoolctl import threadpool_limits
 
-    booster = lgb.Booster(model_file=os.path.join(model_directory_path, "model.txt"))
+    # The upload can rewrite model.txt with CRLF line endings. LightGBM seeks to each tree by
+    # the byte offsets in its `tree_sizes=` header, so one extra byte per line breaks loading.
+    with open(os.path.join(model_directory_path, "model.txt"), "rb") as f:
+        model_str = f.read().decode("utf-8").replace("\r\n", "\n")
+    booster = lgb.Booster(model_str=model_str)
 
     with threadpool_limits(limits=1):
         yield  # ready
