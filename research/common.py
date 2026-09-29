@@ -16,6 +16,7 @@ import main  # noqa: E402
 from data_loader.load import Dataset, load, load_test_reduced, load_train  # noqa: E402
 
 CACHE = os.path.join(ROOT, "cache")
+CACHE_STRIDE = 2
 
 
 def _feat_one(args):
@@ -30,10 +31,11 @@ def compute_features(ds: Dataset, processes: int = 20) -> dict:
     with Pool(processes) as pool:
         feats = pool.map(_feat_one, jobs, chunksize=20)
     print(f"features: {len(ds)} series in {time.time() - t0:.1f}s")
-    X = np.concatenate(feats)
-    series = np.concatenate([np.full(len(f), k, dtype=np.int32) for k, f in enumerate(feats)])
-    step = np.concatenate([np.arange(len(f), dtype=np.int32) for f in feats])
-    y = np.concatenate([ds.labels(k) for k in range(len(ds))]).astype(np.int8)
+    # keep every CACHE_STRIDE-th step: halves memory, and training only uses even steps anyway
+    X = np.concatenate([f[::CACHE_STRIDE] for f in feats])
+    series = np.concatenate([np.full(len(f[::CACHE_STRIDE]), k, dtype=np.int32) for k, f in enumerate(feats)])
+    step = np.concatenate([np.arange(0, len(f), CACHE_STRIDE, dtype=np.int32) for f in feats])
+    y = np.concatenate([ds.labels(k)[::CACHE_STRIDE] for k in range(len(ds))]).astype(np.int8)
     return dict(X=X, y=y, series=series, step=step, names=np.array(main.FEATURE_NAMES))
 
 

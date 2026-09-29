@@ -12,6 +12,15 @@ import numpy as np
 from common import cached, folds, load_test_reduced, load_train, main, ts_auc
 
 
+def step_weights(y, step):
+    """Per-row weight n_pos(t) * n_neg(t) / n(t) (mean 1), so each step totals n_pos * n_neg as in TS-AUC."""
+    n = np.bincount(step).astype(np.float64)
+    pos = np.bincount(step, weights=y.astype(np.float64))
+    w_step = pos * (n - pos) / np.maximum(n, 1)
+    w = w_step[step]
+    return w / w.mean()
+
+
 def run():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rebuild", action="store_true")
@@ -19,6 +28,8 @@ def run():
     ap.add_argument("--rounds", type=int, default=main.NUM_ROUNDS)
     ap.add_argument("--drop", nargs="*", default=[], help="drop features starting with these")
     ap.add_argument("--param", nargs="*", default=[], help="LightGBM overrides key=value")
+    ap.add_argument("--drop-sub", nargs="*", default=[], help="drop features containing these")
+    ap.add_argument("--weight", action="store_true", help="weight rows by TS-AUC step weight")
     ap.add_argument("--keep", nargs="*", default=None, help="keep only features starting with these")
     args = ap.parse_args()
 
@@ -28,6 +39,7 @@ def run():
     cols = [
         i for i, n in enumerate(names)
         if not any(n.startswith(p) for p in args.drop)
+        and not any(p in n for p in args.drop_sub)
         and (args.keep is None or n in main.META_NAMES or any(n.startswith(p) for p in args.keep))
     ]
     print(f"{len(cols)} features, {len(tr['y'])} train rows")
@@ -42,7 +54,8 @@ def run():
         val = np.flatnonzero(fold_of == f)
         b = lgb.train(
             dict(main.LGB_PARAMS, num_threads=20, **{k: type(main.LGB_PARAMS.get(k, 0.0))(v) for k, v in (p.split("=") for p in args.param)}),
-            lgb.Dataset(X[trn], y[trn], feature_name=[names[i] for i in cols]),
+            lgb.Dataset(X[trn], y[trn], weight=step_weights(y[trn], step[trn]) if args.weight else None,
+                        feature_name=[names[i] for i in cols]),
             num_boost_round=args.rounds,
         )
         oof[val] = b.predict(X[val])
