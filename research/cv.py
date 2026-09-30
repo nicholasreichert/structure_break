@@ -44,7 +44,10 @@ def run():
     ]
     print(f"{len(cols)} features, {len(tr['y'])} train rows")
 
-    X, y, series, step = tr["X"][:, cols], tr["y"], tr["series"], tr["step"]
+    X = tr.pop("X")
+    if len(cols) < X.shape[1]:
+        X = X[:, cols]  # copy only when something is dropped
+    y, series, step = tr["y"], tr["series"], tr["step"]
     fold_of = folds(series.max() + 1)[series]
     oof = np.full(len(y), np.nan)
     stride = main.TRAIN_ROW_STRIDE
