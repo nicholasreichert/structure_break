@@ -447,16 +447,43 @@ NUM_ROUNDS = 1200
 N_SEEDS = 3  # models averaged (raw scores) at inference; each uses its own bagging/feature seed
 TRAIN_ROW_STRIDE = 2  # keep every other online step; neighbouring steps are near-duplicates
 
+# Shifted-start copies (v9). The model is data-limited (2/5 -> 4/5 of the series: +0.011
+# TS-AUC), and breaks are the scarce part. Each copy moves the first k online points, all
+# pre-break (k < tau), into the history: tau' = tau - k, same post-break data, seen from a
+# different start (history calibration, accumulated sums). Copy c draws k with seed c.
+# 2-fold CV (lr 0.05, seeds 1-2): none 0.6195, 1 copy 0.6236, 2 copies 0.6271,
+# 4 copies at stride 4 (same rows as 2 at stride 2) 0.6269.
+SHIFT_COPIES = 2
+SHIFT_STRIDE = 2
+SHIFT_MIN_ONLINE = 10
+
+
+def shift_amounts(taus: np.ndarray, online_lens: np.ndarray, seed: int) -> np.ndarray:
+    """k per series; taus = -1 for no break (then k < T/2)."""
+    u = np.random.default_rng(seed).uniform(0.0, 1.0, len(online_lens))
+    lim = np.where(taus >= 0, taus, online_lens // 2)
+    lim = np.minimum(lim, online_lens - SHIFT_MIN_ONLINE)
+    return np.where(lim >= 1, np.floor(u * lim).astype(int), 0)
+
 
 def build_training_matrix(datasets, stride: int = TRAIN_ROW_STRIDE):
+    datasets = list(datasets)
+    taus = np.array([-1 if tau is None else int(tau) for *_, tau in datasets])
+    lens = np.array([len(x_online) for _, _, x_online, _ in datasets])
+    ks = [np.zeros(len(datasets), dtype=int)] + [
+        shift_amounts(taus, lens, c) for c in range(SHIFT_COPIES)
+    ]
     Xs, ys = [], []
-    for _, x_hist, x_online, tau in datasets:
-        F = series_features(x_hist, x_online)
-        y = np.zeros(len(F), dtype=np.float32)
-        if tau is not None:
-            y[int(tau):] = 1.0
-        Xs.append(F[::stride])
-        ys.append(y[::stride])
+    for c, k_all in enumerate(ks):
+        st = stride if c == 0 else SHIFT_STRIDE
+        for (_, x_hist, x_online, _), tau, k in zip(datasets, taus, k_all):
+            xh = np.concatenate([np.asarray(x_hist, dtype=np.float64), np.asarray(x_online[:k], dtype=np.float64)])
+            F = series_features(xh, x_online[k:])
+            y = np.zeros(len(F), dtype=np.float32)
+            if tau >= 0:
+                y[tau - k :] = 1.0
+            Xs.append(F[::st])
+            ys.append(y[::st])
     return np.concatenate(Xs), np.concatenate(ys)
 
 

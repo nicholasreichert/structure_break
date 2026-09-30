@@ -64,3 +64,35 @@ v8 (v7 features, slower learning, 3-seed average) is the end of the cheap gains.
 
 Scripts: `null_calib.py`, `null_check.py`, `oracle_acf.py`, `oracle_lags.py`, `oracle_whiten.py`,
 `bayes_cp.py`, `calfeat.py`, `calfeat2.py`, `cv_extra.py`, `blocks2.py`, `rcal.py`, `cv2.py`.
+
+## 30 Sep afternoon: where the gap actually is, and the one lever left (v9)
+
+Fast settings (lr 0.05, 600 rounds). NB `common.folds()` makes **5** folds; "2-fold CV" trains
+on 4/5 and validates folds 0 and 1 only, so OOF arrays must be masked to folds < 2.
+
+| Probe (`diag_gap.py`) | Fold 0 TS-AUC |
+|---|---|
+| v8 features, 4/5 of series | 0.6310 |
+| v8 features, 2/5 of series | 0.6203 |
+| v8 features + hidden T (`log T`, `(t+1)/T`), **diagnostic only** | **0.6874** |
+| T features alone | 0.6023 |
+
+- **The leaderboard gap is information about T.** Our detector plus the online length lands
+  on the top score (0.687) almost exactly. T is hidden by the runner and using it is against
+  the rules, so the realistic ceiling for honest pipelines is the ~0.62-0.64 band.
+- **The model is data-limited**: +0.011 per doubling of training series. Break examples are
+  the scarce part.
+
+| Variant (2-fold OOF) | OOF |
+|---|---|
+| baseline, seeds 1-2 | 0.6195 |
+| model-level pseudo-null: last m history points scored as a known no-break run, stage 2 on the gap (`pseudo_null.py`) | 0.571 (stage 2 without it 0.607): no |
+| history tails as extra negative series (`pseudo_aug.py`) | 0.6178: no |
+| + 1 shifted-start copy (`shift_aug.py`) | 0.6236 |
+| **+ 2 shifted-start copies** | **0.6271** (both folds, both seeds) |
+| + 4 copies at stride 4 (same row count) | 0.6269 |
+
+A shifted-start copy moves the first k < tau online points into the history (tau' = tau - k).
+The post-break data is the same, but the detector sees it after a different history
+calibration and different accumulated sums. That is enough to regularise the trees. v9 ships
+2 copies. At production settings (lr 0.025, 1200 rounds, seed 0): **0.6265 vs v8 0.6198**.
