@@ -57,7 +57,24 @@ STAT_NAMES = (
     + ["ewma", "glr", "glr_age"]
 )
 META_NAMES = ["log_n"]
-FEATURE_NAMES = META_NAMES + [f"{s}_{st}" for s in STREAMS for st in STAT_NAMES]
+
+# Calibrated block (v7). The histories have volatility clustering, so an iid null is wrong
+# by a different amount for every series: inside a history, a 100-point variance z-stat has
+# sd ~1.9, not 1. These streams are (a) whitened by an EWMA volatility carried from the start
+# of the history and (b) accumulated with scales measured on the series' own history *at the
+# same horizon* (sd of rolling k-sums), instead of one long-run sd for every horizon.
+CAL_BURN = 200  # history points skipped before measuring the null (EWMA start-up)
+CAL_LAMBDAS = (0.97, 0.99)
+CAL_WINDOWS = (16, 64, 256)
+CAL_ALPHA = 0.03
+CAL_GRID = 1 << np.arange(11)  # horizons 1, 2, 4, ..., 1024
+CAL_KINDS = ("lvl", "sq", "abs", "ac1", "vol1")
+# (AR-residual bases, lag-2/5 products and tail/centre rates were tried too: no CV gain)
+CAL_STREAMS = [f"{b}_{k}" for b in ("g", "w97", "w99") for k in CAL_KINDS]
+CAL_STATS = ["sum"] + [f"w{w}" for w in CAL_WINDOWS] + ["ewma"]
+CAL_NAMES = [f"c_{s}_{st}" for s in CAL_STREAMS for st in CAL_STATS]
+
+FEATURE_NAMES = META_NAMES + [f"{s}_{st}" for s in STREAMS for st in STAT_NAMES] + CAL_NAMES
 N_FEATURES = len(FEATURE_NAMES)
 
 
@@ -124,6 +141,86 @@ def _ridge_loo(F: np.ndarray, y: np.ndarray):
     return beta, ym - float(fm @ beta), loo
 
 
+class CalBlock:
+    """Whitened streams with horizon-calibrated running sums (see CAL_* above).
+
+    `step(g)` turns one normal score into stream values;
+    the history is replayed through it, `fit_null` measures the per-horizon scales on that
+    replay, and `update` accumulates the online stream values into features.
+    """
+
+    def __init__(self):
+        self.v = [1.0] * len(CAL_LAMBDAS)  # EWMA of g^2 per lambda (variance before this step)
+        self.prev = [0.0] * (1 + len(CAL_LAMBDAS))  # last value of each base
+
+    def step(self, g: float) -> list:
+        bases = [g]
+        g2 = g * g
+        for j, lam in enumerate(CAL_LAMBDAS):
+            bases.append(g / math.sqrt(self.v[j]))
+            self.v[j] = lam * self.v[j] + (1.0 - lam) * g2
+        out = []
+        for b, b1 in zip(bases, self.prev):
+            a = abs(b)
+            out += [b, b * b, a, b * b1, a * abs(b1)]
+        self.prev = bases
+        return out
+
+    def fit_null(self, C: np.ndarray):
+        """C: replayed stream values over the history (rows = time), burn-in included."""
+        C = C[CAL_BURN - MAX_LAG :]  # rows start at history index MAX_LAG
+        self.ctr = C.mean(0)
+        eh = (C - self.ctr).T
+        ns, n = eh.shape
+        c = np.concatenate([np.zeros((ns, 1)), np.cumsum(eh, 1)], 1)
+        sds = []
+        for k in CAL_GRID:
+            if k < n // 2:
+                sds.append((c[:, k:] - c[:, :-k]).std(1))
+            else:  # history too short for this horizon: extend at constant variance ratio
+                sds.append(sds[-1] * math.sqrt(k / CAL_GRID[len(sds) - 1]))
+        lsd = np.log(np.maximum(np.array(sds).T, 1e-9))
+        # per-horizon table 1..1024 by log-log interpolation between grid points
+        lk = np.log2(np.arange(1, CAL_GRID[-1] + 1))
+        lo = np.floor(lk).astype(int)
+        hi = np.minimum(lo + 1, len(CAL_GRID) - 1)
+        f = lk - lo
+        self.inv_sd = np.ascontiguousarray((1.0 / np.exp((1 - f) * lsd[:, lo] + f * lsd[:, hi])).T)
+        a = CAL_ALPHA
+        ew = np.zeros(ns)
+        ews = []
+        for row in eh.T:
+            ew = (1 - a) * ew + a * row
+            ews.append(ew)
+        self.inv_ew_sd = 1.0 / np.maximum(np.array(ews)[int(3 / a):].std(0), 1e-9)
+        self.n = 0
+        self.cum = np.zeros((64, ns))
+        self.ew = np.zeros(ns)
+
+    def _inv_sd(self, k: int) -> np.ndarray:
+        if k <= len(self.inv_sd):
+            return self.inv_sd[k - 1]
+        return self.inv_sd[-1] * math.sqrt(len(self.inv_sd) / k)
+
+    def update(self, vals: list) -> list:
+        e = np.asarray(vals) - self.ctr
+        self.n += 1
+        n = self.n
+        if n >= len(self.cum):
+            self.cum = np.concatenate([self.cum, np.zeros_like(self.cum)])
+        cs = self.cum[n - 1] + e
+        self.cum[n] = cs
+        out = [cs * self._inv_sd(n)]
+        for w in CAL_WINDOWS:
+            if n > w:
+                out.append((cs - self.cum[n - w]) * self._inv_sd(w))
+            else:
+                out.append(cs * self._inv_sd(n))
+        self.ew = (1 - CAL_ALPHA) * self.ew + CAL_ALPHA * e
+        out.append(self.ew * self.inv_ew_sd)
+        return np.stack(out, 1).ravel().tolist()  # stream-major, matching CAL_NAMES
+
+
 class FeatureState:
     """Running state for one series. `update(x)` returns the feature vector (list)."""
 
@@ -153,9 +250,15 @@ class FeatureState:
         # replay the history through the same stream function to get null statistics
         self.z_lags = z[:MAX_LAG][::-1].tolist()  # most recent first
         self.g_lags = [self._g(v) for v in xh[:MAX_LAG][::-1]]
+        self.cal = CalBlock()
         self.replay = True  # skip the online predictor; nl_hist holds the LOO values
-        H = np.array([self._raw(float(v)) for v in xh[MAX_LAG:]])
+        rows, cal_rows = [], []
+        for v in xh[MAX_LAG:]:
+            rows.append(self._raw(float(v)))
+            cal_rows.append(self.cal_vals)
         self.replay = False
+        H = np.array(rows)
+        self.cal.fit_null(np.array(cal_rows))
         H[:, -N_LEARNED:] = nl_hist[MAX_LAG - NL_P :]
         self.center = H.mean(0).tolist()
         self.scale = [1.0 / _long_run_sd(H[:, i]) for i in range(H.shape[1])]
@@ -215,6 +318,7 @@ class FeatureState:
         rt = (zt - pred) / self.r_sd
         rs = self.r_sorted
         rg = self.rtab[bisect_left(rs, rt) + bisect_right(rs, rt)]
+        self.cal_vals = self.cal.step(gt)
         d = zt - zl[0]
         g2 = gt * gt
         ag = abs(gt)
@@ -313,6 +417,7 @@ class FeatureState:
             feats.append(ew[i] * self.ew_norm)
             feats.append(glr[i])
             feats.append(glr_age[i])
+        feats += self.cal.update(self.cal_vals)
         return feats
 
 
