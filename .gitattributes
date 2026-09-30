@@ -1,1 +1,1 @@
-resources/model.txt -text
+resources/model*.txt -text

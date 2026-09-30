@@ -34,6 +34,23 @@ the true break time, compares data after it with the history, and is a plain AUC
 | **+ calibrated block (v7)**: EWMA-vol whitening + per-series horizon calibration | **0.6194** |
 | + second calibrated block (AR residual, lag 2/5, tail/centre) | 0.6189 (no gain) |
 
+### Follow-ups, 29-30 Sep (`research/cv2.py`, v7 features, same 2 folds)
+
+Seed noise alone is about +-0.0015 on this OOF score: v7 gave 0.6194 and 0.6178 under
+different bagging/feature seeds. Single-run differences below ~0.002 are not results.
+
+| Variant | OOF | Verdict |
+|---|---|---|
+| v7 reference (seed 0) | 0.6178 | |
+| per-step TS-AUC row weights | 0.6172 | no |
+| `rank_xendcg`, online step as query | 0.6169 (0.6193 blended with v7) | no alone; blend gain is variance reduction |
+| + per-series GARCH(1,1)-whitened block | 0.6196 single seed; **3 seeds: 0.6204 vs 0.6201 without** | noise, dropped |
+| + order-3 ordinal-pattern block | 0.6148 | worse |
+| + horizon-recalibrated v6 sums/windows (`rcal.py`) | 0.6168 | no |
+| num_leaves 31 | 0.6185 | noise |
+| lr 0.025, 1200 rounds | 0.6198 | yes |
+| **lr 0.025, 1200 rounds, 3-seed average (v8)** | **0.6201** | shipped |
+
 Oracle check of the same idea on 5 simple statistics: GBDT 0.547 (iid null) -> 0.563
 (+calibration) -> 0.607 (+whitened).
 
@@ -43,7 +60,7 @@ Every legitimate family we and the forum have measured tops out around 0.62-0.64
 beyond that is not explained by any detector or model class anyone has published. The
 remaining candidates are all things we can't or shouldn't do: external data matching the
 real-world half of the series, or information the runner is designed to hide.
-Realistic target for the deadline: bank v7, then small robust gains (seed bagging, rounds).
+v8 (v7 features, slower learning, 3-seed average) is the end of the cheap gains.
 
 Scripts: `null_calib.py`, `null_check.py`, `oracle_acf.py`, `oracle_lags.py`, `oracle_whiten.py`,
-`bayes_cp.py`, `calfeat.py`, `calfeat2.py`, `cv_extra.py`.
+`bayes_cp.py`, `calfeat.py`, `calfeat2.py`, `cv_extra.py`, `blocks2.py`, `rcal.py`, `cv2.py`.
