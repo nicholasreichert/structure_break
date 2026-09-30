@@ -70,6 +70,7 @@ CAL_ALPHA = 0.03
 CAL_GRID = 1 << np.arange(11)  # horizons 1, 2, 4, ..., 1024
 CAL_KINDS = ("lvl", "sq", "abs", "ac1", "vol1")
 # (AR-residual bases, lag-2/5 products and tail/centre rates were tried too: no CV gain)
+# (a per-series GARCH(1,1) whitening base was tried too: +0.0003 over 3 seeds, i.e. noise)
 CAL_STREAMS = [f"{b}_{k}" for b in ("g", "w97", "w99") for k in CAL_KINDS]
 CAL_STATS = ["sum"] + [f"w{w}" for w in CAL_WINDOWS] + ["ewma"]
 CAL_NAMES = [f"c_{s}_{st}" for s in CAL_STREAMS for st in CAL_STATS]
@@ -430,7 +431,7 @@ def series_features(x_hist, x_online) -> np.ndarray:
 
 LGB_PARAMS = dict(
     objective="binary",
-    learning_rate=0.05,
+    learning_rate=0.025,
     num_leaves=15,
     min_data_in_leaf=2000,
     feature_fraction=0.7,
@@ -442,7 +443,8 @@ LGB_PARAMS = dict(
     deterministic=True,
     force_col_wise=True,
 )
-NUM_ROUNDS = 600
+NUM_ROUNDS = 1200
+N_SEEDS = 3  # models averaged (raw scores) at inference; each uses its own bagging/feature seed
 TRAIN_ROW_STRIDE = 2  # keep every other online step; neighbouring steps are near-duplicates
 
 
@@ -465,12 +467,14 @@ def train(
     import lightgbm as lgb
 
     X, y = build_training_matrix(datasets)
-    booster = lgb.train(
-        LGB_PARAMS,
-        lgb.Dataset(X, y, feature_name=FEATURE_NAMES, free_raw_data=True),
-        num_boost_round=NUM_ROUNDS,
-    )
-    booster.save_model(os.path.join(model_directory_path, "model.txt"))
+    ds = lgb.Dataset(X, y, feature_name=FEATURE_NAMES, free_raw_data=False)
+    for s in range(N_SEEDS):
+        booster = lgb.train(seed_params(s), ds, num_boost_round=NUM_ROUNDS)
+        booster.save_model(os.path.join(model_directory_path, f"model_{s}.txt"))
+
+
+def seed_params(s: int) -> dict:
+    return dict(LGB_PARAMS, seed=s, bagging_seed=s, feature_fraction_seed=s)
 
 
 def infer(
@@ -482,9 +486,10 @@ def infer(
 
     # The upload can rewrite model.txt with CRLF line endings. LightGBM seeks to each tree by
     # the byte offsets in its `tree_sizes=` header, so one extra byte per line breaks loading.
-    with open(os.path.join(model_directory_path, "model.txt"), "rb") as f:
-        model_str = f.read().decode("utf-8").replace("\r\n", "\n")
-    booster = lgb.Booster(model_str=model_str)
+    boosters = []
+    for s in range(N_SEEDS):
+        with open(os.path.join(model_directory_path, f"model_{s}.txt"), "rb") as f:
+            boosters.append(lgb.Booster(model_str=f.read().decode("utf-8").replace("\r\n", "\n")))
 
     with threadpool_limits(limits=1):
         yield  # ready
@@ -494,4 +499,8 @@ def infer(
             st = FeatureState(x_hist)
             for point in x_online:
                 buf[0, :] = st.update(float(point))
-                yield float(booster.predict(buf, num_threads=1)[0])
+                # mean raw score (log-odds) over the seeds; only the per-step ranking matters
+                raw = 0.0
+                for b in boosters:
+                    raw += b.predict(buf, raw_score=True, num_threads=1)[0]
+                yield float(raw / N_SEEDS)
