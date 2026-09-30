@@ -1,7 +1,7 @@
 """Fit the production models on ALL training series -> resources/model_{s}.txt.
 
-Equivalent to main.train() (same features, stride, params, seeds), but reuses the cached
-features in cache/train.npz. Columns are picked by name, so the matrix matches
+Equivalent to main.train() (same features, stride, params, seeds, shifted copies), but reuses
+the cached features in cache/train.npz and cache/shift[c]_train.npz (research/shift_aug.py). Columns are picked by name, so the matrix matches
 main.FEATURE_NAMES exactly even if the cache holds extra (research) columns.
 """
 import os
@@ -20,8 +20,16 @@ def load_matrix():
     X = d["X"]
     del d
     keep = np.flatnonzero(step % main.TRAIN_ROW_STRIDE == 0)
-    X = X[keep][:, [names.index(n) for n in main.FEATURE_NAMES]]
-    return X, y[keep].astype(np.float32)
+    cols = [names.index(n) for n in main.FEATURE_NAMES]
+    Xs, ys = [X[keep][:, cols]], [y[keep].astype(np.float32)]
+    del X
+    for c in range(main.SHIFT_COPIES):
+        A = np.load(os.path.join(CACHE, "shift_train.npz" if c == 0 else f"shift{c}_train.npz"))
+        keep = np.flatnonzero(A["step"] % main.SHIFT_STRIDE == 0)
+        Xs.append(A["X"][keep])  # built from main.series_features: columns already in order
+        ys.append(A["y"][keep].astype(np.float32))
+        del A
+    return np.concatenate(Xs), np.concatenate(ys)
 
 
 def run():
