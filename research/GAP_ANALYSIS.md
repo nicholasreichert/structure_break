@@ -95,4 +95,4 @@ on 4/5 and validates folds 0 and 1 only, so OOF arrays must be masked to folds <
 A shifted-start copy moves the first k < tau online points into the history (tau' = tau - k).
 The post-break data is the same, but the detector sees it after a different history
 calibration and different accumulated sums. That is enough to regularise the trees. v9 ships
-2 copies.
+2 copies. At production settings (lr 0.025, 1200 rounds, seed 0): **0.6265 vs v8 0.6198**.
